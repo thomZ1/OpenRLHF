@@ -59,7 +59,7 @@ class ActorPPOTrainer(PPOTrainer):
 
         backend = getattr(self.strategy.args, "vllm_sync_backend", "nccl")
         self.use_cuda_ipc = False
-        if backend == "nccl" and self.strategy.args.colocate_all_models:
+        if backend == "nccl" and (self.strategy.args.colocate_all_models or self.strategy.args.colocate_actor_rollout):
             self.use_cuda_ipc = True
 
         # Create torch group with deepspeed rank 0 and all vllm ranks
@@ -132,7 +132,7 @@ class ActorPPOTrainer(PPOTrainer):
             if self.strategy.args.colocate_all_models:
                 status.update(ray.get(critic_status_ref))
 
-        if self.strategy.args.colocate_all_models:
+        if self.strategy.args.colocate_all_models or self.strategy.args.colocate_actor_rollout or self.strategy.args.colocate_ref_rollout:
             torch.distributed.barrier()
 
         # 3. actor model training

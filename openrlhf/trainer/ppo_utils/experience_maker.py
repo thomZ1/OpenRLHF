@@ -589,7 +589,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
                 sequences_cpu, num_actions, attention_mask_cpu, packed_seq_lens=packed_seq_lens
             )
 
-            if args.colocate_actor_ref or args.colocate_all_models:
+            if args.colocate_actor_ref or args.colocate_all_models or args.colocate_ref_rollout:
                 ray.get([base_action_log_probs_ref])
                 ray.get([self.initial_model.empty_cache.remote()])
         else:
@@ -659,7 +659,7 @@ class RemoteExperienceMaker(NaiveExperienceMaker):
         if args.colocate_critic_reward and not self.remote_rm_url:
             ray.get([self.reward_model[0].empty_cache.remote()])
 
-        if args.colocate_actor_ref or args.colocate_all_models:
+        if args.colocate_actor_ref or args.colocate_all_models or args.colocate_ref_rollout:
             torch.cuda.empty_cache()
 
         if (self.initial_model is not None) and (not args.use_kl_loss):

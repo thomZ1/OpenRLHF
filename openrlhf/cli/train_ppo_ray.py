@@ -50,7 +50,7 @@ def train(args):
     strategy = get_strategy(args)
 
     # if colocated, create placement group for actor and ref model explicitly.
-    pg = None
+    pg, pg_rollout = None, None
     if args.colocate_actor_ref or args.colocate_all_models:
         assert (
             args.actor_num_nodes == args.ref_num_nodes and args.actor_num_gpus_per_node == args.ref_num_gpus_per_node
@@ -59,7 +59,42 @@ def train(args):
         bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.actor_num_nodes * args.actor_num_gpus_per_node)]
         pg = placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
+        pg_rollout = pg
+    elif args.colocate_ref_rollout:
+        assert (
+            args.ref_num_nodes * args.ref_num_gpus_per_node
+            == args.vllm_num_engines * args.vllm_tensor_parallel_size
+        ), (
+            f"ref_num_nodes * ref_num_gpus_per_node must be equal to "
+            f"vllm_num_engines * vllm_tensor_parallel_size, got {args.ref_num_nodes * args.ref_num_gpus_per_node} "
+            f"and {args.vllm_num_engines * args.vllm_tensor_parallel_size}"
+        )
 
+        # create placement group for actor
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.actor_num_nodes * args.actor_num_gpus_per_node)]
+        pg = placement_group(bundles, strategy="PACK")
+        ray.get(pg.ready())
+        # create placement group for rollout and ref.
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.ref_num_nodes * args.ref_num_gpus_per_node)]
+        pg_rollout = placement_group(bundles, strategy="PACK")
+        ray.get(pg_rollout.ready())
+    elif args.colocate_actor_rollout:
+        assert (
+            args.actor_num_nodes * args.actor_num_gpus_per_node
+            == args.vllm_num_engines * args.vllm_tensor_parallel_size
+        ), (
+            f"actor_num_nodes * actor_num_gpus_per_node must be equal to "
+            f"vllm_num_engines * vllm_tensor_parallel_size, got {args.actor_num_nodes * args.actor_num_gpus_per_node} "
+            f"and {args.vllm_num_engines * args.vllm_tensor_parallel_size}"
+        )
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.ref_num_nodes * args.ref_num_gpus_per_node)]
+        pg = placement_group(bundles, strategy="PACK")
+        ray.get(pg.ready())
+        # create placement group for actor and rollout.
+        bundles = [{"GPU": 1, "CPU": 1} for _ in range(args.actor_num_nodes * args.actor_num_gpus_per_node)]
+        pg_rollout = placement_group(bundles, strategy="PACK")
+        ray.get(pg_rollout.ready())
+        
     # init vLLM engine for text generation
     vllm_engines = None
     if args.vllm_num_engines is not None and args.vllm_num_engines > 0:
@@ -78,6 +113,16 @@ def train(args):
                 f"vllm_num_engines * vllm_tensor_parallel_size, got {args.actor_num_nodes * args.actor_num_gpus_per_node} "
                 f"and {args.vllm_num_engines * args.vllm_tensor_parallel_size}"
             )
+        elif args.colocate_ref_rollout and args.vllm_gpu_memory_utilization >= 0.9:
+            args.vllm_gpu_memory_utilization = 0.4
+            print(
+                f"Set args.vllm_gpu_memory_utilization to {args.vllm_gpu_memory_utilization} for colocate_ref_rollout!"
+            )
+        elif args.colocate_actor_rollout and args.vllm_gpu_memory_utilization >= 0.9:
+            args.vllm_gpu_memory_utilization = 0.4
+            print(
+                f"Set args.vllm_gpu_memory_utilization to {args.vllm_gpu_memory_utilization} for colocate_actor_rollout!"
+            )
 
         vllm_engines = create_vllm_engines(
             args.vllm_num_engines,
@@ -88,7 +133,7 @@ def train(args):
             args.enforce_eager,
             max_len,
             args.actor_num_nodes * args.actor_num_gpus_per_node,
-            pg if args.colocate_all_models else None,
+            pg_rollout if args.colocate_all_models or args.colocate_actor_rollout or args.colocate_ref_rollout else None,
             args.vllm_gpu_memory_utilization,
             args.vllm_enable_sleep,
         )
@@ -97,7 +142,7 @@ def train(args):
         args.actor_num_nodes,
         args.actor_num_gpus_per_node,
         ActorModelRayActor,
-        pg=pg,
+        pg=pg_rollout if args.colocate_actor_rollout else pg,
         num_gpus_per_actor=0.2 if pg else 1,
     )
 
@@ -108,7 +153,7 @@ def train(args):
             args.ref_num_nodes,
             args.ref_num_gpus_per_node,
             ReferenceModelRayActor,
-            pg=pg,
+            pg=pg_rollout if args.colocate_ref_rollout else pg,
             num_gpus_per_actor=0.2 if pg else 1,
         )
 
@@ -216,6 +261,19 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="whether to colocate all models (including vLLM engines), if true, they will share same gpus.",
+    )
+    parser.add_argument(
+        "--colocate_actor_rollout",
+        action="store_true",
+        default=False,
+        help="whether to colocate actor model and vLLM engines, if true, they will share same gpus.",
+    )
+
+    parser.add_argument(
+        "--colocate_ref_rollout",
+        action="store_true",
+        default=False,
+        help="whether to colocate ref model and  vLLM engines, if true, they will share same gpus.",
     )
 
     # optional vLLM for text generation
@@ -424,8 +482,8 @@ if __name__ == "__main__":
         assert args.vllm_num_engines > 0, "Only support `--packing_samples` with vLLM."
         assert not args.pretrain_data, "`--pretrain_data` is not supported with `--packing_samples` yet."
 
-    if args.vllm_enable_sleep and not args.colocate_all_models:
-        print("Set args.vllm_enable_sleep to False when args.colocate_all_models is disabled.")
+    if args.vllm_enable_sleep and not (args.colocate_all_models or args.colocate_ref_rollout or args.colocate_actor_rollout) :
+        print("Set args.vllm_enable_sleep to False when args.colocate_rollout is disabled.")
         args.vllm_enable_sleep = False
 
     if args.use_ms:
